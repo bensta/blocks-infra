@@ -1,0 +1,141 @@
+# Local adaptations layered on the upstream docker-compose.yml.
+#
+# Compose merges this file automatically, so docker-compose.yml stays byte-identical
+# to upstream and can be updated from the remote without conflicts. Everything here
+# is specific to running the stack on a developer machine — in particular on Apple
+# Silicon, where the published amd64-only images run under emulation.
+#
+#   docker compose --profile infra --profile apps --profile local-edge up -d
+#
+# Prerequisites (see README-local.md):
+#   BlocksRootDb/ and BlocksConfiguration/   BSON dumps for mongodb-seed
+#   configure.js                             bash configure.sh
+#   certs/                                   mkcert + scripts/gen-seed.sh
+
+x-local-app: &local-app
+  environment:
+    # amd64-only images under qemu: .NET's W^X JIT handling corrupts dynamically
+    # generated reflection stubs and the MongoDB driver crashes the process.
+    # Harmless on a native amd64 host.
+    DOTNET_EnableWriteXorExecute: "0"
+    # Trust the locally-signed CA so service-to-service HTTPS to *.${DOMAIN} works.
+    SSL_CERT_FILE: /etc/ssl/certs/ca-bundle.crt
+    # Fallback for CORS; normally resolved from the root tenant's Applications[].
+    BlocksSecret__AllowedCorsOrigins: "https://os.${DOMAIN},https://iam.${DOMAIN},https://data.${DOMAIN},https://logic.${DOMAIN}"
+  volumes:
+    - "./certs/ca-bundle.crt:/etc/ssl/certs/ca-bundle.crt:ro"
+
+services:
+  # The upstream healthcheck embeds spaces in a single --eval argument. The
+  # podman-compose provider word-splits the CMD array, so mongosh receives only
+  # "db.runCommand({" and the container never turns healthy.
+  mongodb:
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "mongodb://${MONGO_USER}:${MONGO_PASS}@localhost:27017/admin", "--eval", "db.runCommand({ping:1}).ok"]
+
+  # AuthenticationService reads the tenant's public certificate from Redis and has
+  # no fallback: on a miss every bearer token fails to validate with
+  # "Certificate not found". blocks-os writes this key while provisioning a
+  # project, which a restored root tenant never goes through.
+  cert-cache-seed:
+    profiles: [infra]
+    image: redis:8-alpine
+    container_name: cert-cache-seed
+    restart: "no"
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      ROOT_TENANT_ID: ${ROOT_TENANT_ID}
+    volumes:
+      - "./certs:/certs:ro"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        redis-cli -h redis -x SET "tetocertpublic::$${ROOT_TENANT_ID}" < /certs/tenant-public.pfx
+        echo "primed tetocertpublic::$${ROOT_TENANT_ID}"
+
+  # Stands in for the `edge` profile locally: acme-companion cannot issue for a
+  # domain nobody here owns, so nginx serves a locally-signed wildcard instead.
+  # The network aliases matter — *.${DOMAIN} resolves to 127.0.0.1 via public DNS,
+  # which inside a container is that container itself, so server-to-server calls
+  # (IAM fetching its own token endpoint) would never leave the container.
+  local-edge:
+    profiles: [local-edge]
+    image: nginx:alpine
+    container_name: blocks-edge
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - "./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro"
+      - "./nginx/10-resolver.sh:/docker-entrypoint.d/10-resolver.sh:ro"
+      - "./certs:/etc/nginx/certs:ro"
+    networks:
+      default:
+        aliases:
+          - "agents.${DOMAIN}"
+          - "data.${DOMAIN}"
+          - "iam.${DOMAIN}"
+          - "localization.${DOMAIN}"
+          - "logic.${DOMAIN}"
+          - "monitor.${DOMAIN}"
+          - "os.${DOMAIN}"
+          - "release.${DOMAIN}"
+          - "studio.${DOMAIN}"
+          - "utilities.${DOMAIN}"
+
+
+  # blocksos/blocks-{studio,agents}-{api,worker} are not published on Docker Hub
+  # (404). Moving them out of the `apps` profile lets --profile apps resolve;
+  # drop these blocks if the images ever appear.
+  agents-api:
+    <<: *local-app
+    deploy:
+      replicas: 0
+  agents-worker:
+    <<: *local-app
+    deploy:
+      replicas: 0
+  data-api:
+    <<: *local-app
+  data-worker:
+    <<: *local-app
+  iam-api:
+    <<: *local-app
+  iam-worker:
+    <<: *local-app
+  localization-api:
+    <<: *local-app
+  localization-worker:
+    <<: *local-app
+  logic-api:
+    <<: *local-app
+  logic-worker:
+    <<: *local-app
+  monitor-api:
+    <<: *local-app
+  monitor-worker:
+    <<: *local-app
+  os-api:
+    <<: *local-app
+  os-worker:
+    <<: *local-app
+  release-api:
+    <<: *local-app
+  release-worker:
+    <<: *local-app
+  studio-api:
+    <<: *local-app
+    deploy:
+      replicas: 0
+  studio-worker:
+    <<: *local-app
+    deploy:
+      replicas: 0
+  utilities-api:
+    <<: *local-app
+  utilities-worker:
+    <<: *local-app
